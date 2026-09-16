@@ -1,0 +1,7 @@
+requests==2.32.3
+rapidfuzz==3.9.7
+beautifulsoup4==4.12.3
+streamlit==1.38.0
+python-dotenv==1.0.1
+google-genai==2.23.0
+pandas==2.2.2

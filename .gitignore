@@ -1,0 +1,7 @@
+.env
+data/*.db-journal
+output/*.csv
+__pycache__/
+*.pyc
+.venv/
+venv/

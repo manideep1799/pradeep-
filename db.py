@@ -42,10 +42,18 @@ CREATE TABLE IF NOT EXISTS doctors (
     email               TEXT,
     website             TEXT,
     instagram_handle    TEXT,
+    facebook_url        TEXT,
+    linkedin_url        TEXT,
     youtube_url         TEXT,
     has_own_practice    INTEGER,
+    role_category       TEXT,
     score               INTEGER DEFAULT 0,
     score_reasons       TEXT,
+    adjusted_score      INTEGER,
+    tier                TEXT,
+    rank_reason         TEXT,
+    opening_line        TEXT,
+    researched_at       TIMESTAMP,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at          TIMESTAMP,
     FOREIGN KEY (clinic_place_id) REFERENCES clinics(place_id)
@@ -67,6 +75,21 @@ CREATE INDEX IF NOT EXISTS idx_sources_doctor_id ON sources(doctor_id);
 CREATE INDEX IF NOT EXISTS idx_sources_source_url ON sources(source_url);
 """
 
+# Columns added after the tool's first release. CREATE TABLE above already
+# includes them for a brand-new DB; these ALTERs bring an existing DB (like
+# the one already deployed) up to date. Each is idempotent: a "duplicate
+# column" failure means a previous run already applied it, so it's ignored.
+_MIGRATIONS = [
+    "ALTER TABLE doctors ADD COLUMN facebook_url TEXT",
+    "ALTER TABLE doctors ADD COLUMN linkedin_url TEXT",
+    "ALTER TABLE doctors ADD COLUMN adjusted_score INTEGER",
+    "ALTER TABLE doctors ADD COLUMN tier TEXT",
+    "ALTER TABLE doctors ADD COLUMN rank_reason TEXT",
+    "ALTER TABLE doctors ADD COLUMN opening_line TEXT",
+    "ALTER TABLE doctors ADD COLUMN researched_at TIMESTAMP",
+    "ALTER TABLE doctors ADD COLUMN role_category TEXT",
+]
+
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH)
@@ -80,6 +103,13 @@ def init_db() -> None:
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        for stmt in _MIGRATIONS:
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
     finally:
         conn.close()
 
@@ -139,8 +169,8 @@ def insert_doctor(conn: sqlite3.Connection, data: dict) -> int:
     fields = [
         "name", "name_normalized", "qualification", "specialty", "experience_years",
         "designation", "clinic_place_id", "clinic_name", "hospital_affiliation",
-        "locality", "phone", "email", "website", "instagram_handle", "youtube_url",
-        "has_own_practice",
+        "locality", "phone", "email", "website", "instagram_handle", "facebook_url",
+        "linkedin_url", "youtube_url", "has_own_practice",
     ]
     values = [data.get(f) for f in fields]
     columns = [*fields, "updated_at"]
@@ -196,6 +226,20 @@ def reassign_sources(conn: sqlite3.Connection, from_doctor_id: int, to_doctor_id
 
 def all_doctors(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM doctors").fetchall()
+
+
+def doctors_pending_research(conn: sqlite3.Connection, limit: int | None = None) -> list[sqlite3.Row]:
+    """Highest-scoring un-researched doctors first — Gemini's free-tier quota
+    is tight enough that ordering which doctor gets today's calls matters."""
+    sql = "SELECT * FROM doctors WHERE researched_at IS NULL ORDER BY score DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        return conn.execute(sql, (limit,)).fetchall()
+    return conn.execute(sql).fetchall()
+
+
+def mark_researched(conn: sqlite3.Connection, doctor_id: int, updates: dict) -> None:
+    update_doctor(conn, doctor_id, {**updates, "researched_at": _now()})
 
 
 def doctors_at_clinic_count(conn: sqlite3.Connection, clinic_place_id: str) -> int:

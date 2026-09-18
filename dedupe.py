@@ -53,7 +53,8 @@ def _completeness(doc: dict) -> int:
     fields = [
         "qualification", "specialty", "experience_years", "designation",
         "clinic_place_id", "clinic_name", "hospital_affiliation", "locality",
-        "phone", "email", "website", "instagram_handle", "youtube_url",
+        "phone", "email", "website", "instagram_handle", "facebook_url",
+        "linkedin_url", "youtube_url",
     ]
     return sum(1 for f in fields if doc.get(f) not in (None, ""))
 
@@ -73,7 +74,8 @@ def _merge_cluster(conn, cluster: list[dict]) -> int:
     other_fields = [
         "name", "qualification", "specialty", "experience_years", "designation",
         "clinic_place_id", "clinic_name", "hospital_affiliation", "locality",
-        "instagram_handle", "youtube_url", "has_own_practice",
+        "instagram_handle", "facebook_url", "linkedin_url", "youtube_url",
+        "has_own_practice",
     ]
 
     survivor = max(cluster, key=_completeness)

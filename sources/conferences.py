@@ -58,7 +58,7 @@ def run_conference_extraction(conn, dry_run: bool = False) -> dict:
             print(f"  ! fetch failed for {url}: {error}")
             continue
 
-        text = extract.html_to_text(html)
+        text = extract.html_to_text(html, base_url=url)
         result = extract.extract_structured(text, mode="conference")
         if result:
             for doc in result.get("doctors") or []:

@@ -43,6 +43,7 @@ def compute_score(conn, doctor: dict) -> tuple[int, list[str]]:
     reasons = []
 
     has_own_practice = bool(doctor.get("has_own_practice"))
+    role_category = doctor.get("role_category")
     phone = doctor.get("phone")
     email = doctor.get("email")
     website = doctor.get("website")
@@ -54,6 +55,8 @@ def compute_score(conn, doctor: dict) -> tuple[int, list[str]]:
 
     if has_own_practice:
         score += w["has_own_practice"]; reasons.append("owns practice")
+    if role_category == "Senior Decision-Maker":
+        score += w["senior_decision_maker"]; reasons.append("senior decision-maker")
     if phone or email:
         score += w["reachable"]; reasons.append("reachable")
     if website:

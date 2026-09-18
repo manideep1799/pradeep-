@@ -27,9 +27,23 @@ class OverpassError(Exception):
 _HEALTHCARE_AMENITIES = ["clinic", "hospital", "doctors", "dentist"]
 
 
-def _bbox_str() -> str:
-    s, w, n, e = config.HYDERABAD_BBOX
+def _bbox_str(bbox: tuple[float, float, float, float]) -> str:
+    s, w, n, e = bbox
     return f"{s},{w},{n},{e}"
+
+
+def _bbox_for_locality(locality: str) -> tuple[float, float, float, float] | None:
+    """A small box around a locality's centroid, sized off the same radius
+    used to bucket clinics into localities by nearest distance — keeps
+    query and classification roughly consistent with each other."""
+    centroid = config.LOCALITY_CENTROIDS.get(locality)
+    if not centroid:
+        return None
+    lat, lon = centroid
+    radius_km = config.MAX_LOCALITY_DISTANCE_KM
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
+    return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
 
 
 def _run_query(ql: str, retries: int = 1) -> list[dict]:
@@ -64,22 +78,22 @@ def _run_query(ql: str, retries: int = 1) -> list[dict]:
     raise last_error
 
 
-def _discovery_queries() -> list[tuple[str, str]]:
+def _discovery_queries(bbox: tuple[float, float, float, float]) -> list[tuple[str, str]]:
     """One smaller query per tag, rather than one giant combined query —
     each is far less likely to time out on the public Overpass instance, and
     a failure on one tag doesn't cost the others. Returns [(label, ql), ...]."""
-    bbox = _bbox_str()
+    bbox_str = _bbox_str(bbox)
     queries = []
     for amenity in _HEALTHCARE_AMENITIES:
         ql = (
             f"[out:json][timeout:{config.OVERPASS_TIMEOUT_SECONDS}];\n"
-            f"(\n  node[\"amenity\"=\"{amenity}\"]({bbox});\n"
-            f"  way[\"amenity\"=\"{amenity}\"]({bbox});\n);\nout center tags;"
+            f"(\n  node[\"amenity\"=\"{amenity}\"]({bbox_str});\n"
+            f"  way[\"amenity\"=\"{amenity}\"]({bbox_str});\n);\nout center tags;"
         )
         queries.append((f"amenity={amenity}", ql))
     healthcare_ql = (
         f"[out:json][timeout:{config.OVERPASS_TIMEOUT_SECONDS}];\n"
-        f"(\n  node[\"healthcare\"]({bbox});\n  way[\"healthcare\"]({bbox});\n);\nout center tags;"
+        f"(\n  node[\"healthcare\"]({bbox_str});\n  way[\"healthcare\"]({bbox_str});\n);\nout center tags;"
     )
     queries.append(("healthcare=*", healthcare_ql))
     return queries
@@ -175,31 +189,27 @@ def _element_to_clinic_row(el: dict) -> dict | None:
     }
 
 
-def run_discovery(conn, dry_run: bool = False) -> dict:
-    """Pull every clinic/hospital/doctors/dentist node+way in the Hyderabad
-    bbox from OSM, as several smaller per-tag queries rather than one giant
-    one — each is far less likely to time out, and one tag failing doesn't
-    cost the others. Idempotent: re-running upserts the same osm:type:id
-    rows rather than duplicating. Only raises (stopping the run) if every
-    single query failed, since that likely means the service itself is down."""
-    queries = _discovery_queries()
+def _run_discovery_for_bbox(conn, bbox: tuple[float, float, float, float],
+                             dry_run: bool, label: str) -> dict:
+    queries = _discovery_queries(bbox)
 
     if dry_run:
-        print(f"[dry-run] would run {len(queries)} Overpass queries covering the Hyderabad bbox:")
-        for label, ql in queries:
-            print(f"--- {label} ---\n{ql}")
-        return {"elements_fetched": 0, "unique_clinics_upserted": 0}
+        print(f"[dry-run] would run {len(queries)} Overpass queries for {label!r}:")
+        for q_label, ql in queries:
+            print(f"--- {q_label} ---\n{ql}")
+        return {"elements_fetched": 0, "unique_clinics_upserted": 0, "skipped_unnamed": 0,
+                "queries_failed": 0, "queries_total": len(queries)}
 
     total_elements = 0
     upserted = 0
     skipped_unnamed = 0
     queries_failed = 0
 
-    for label, ql in queries:
+    for q_label, ql in queries:
         try:
             elements = _run_query(ql)
         except OverpassError as exc:
-            print(f"  ! query for {label!r} failed, skipping: {exc}")
+            print(f"  ! query for {label}/{q_label} failed, skipping: {exc}")
             queries_failed += 1
             time.sleep(config.REQUEST_DELAY_SECONDS)
             continue
@@ -210,20 +220,86 @@ def run_discovery(conn, dry_run: bool = False) -> dict:
             if row is None:
                 skipped_unnamed += 1
                 continue
+            # We deliberately queried a small box around this locality's own
+            # centroid, so it's a trustworthy fallback when OSM's own tags
+            # gave _guess_locality() nothing to work with — better than
+            # leaving locality null or falling through to a raw addr:city.
+            if label != "citywide":
+                row["locality"] = row.get("locality") or label
             db.upsert_clinic(conn, row)
             upserted += 1
 
         time.sleep(config.REQUEST_DELAY_SECONDS)
-
-    if queries_failed == len(queries):
-        raise OverpassError("every Overpass discovery query failed — the service may be down")
 
     return {
         "elements_fetched": total_elements,
         "unique_clinics_upserted": upserted,
         "skipped_unnamed": skipped_unnamed,
         "queries_failed": queries_failed,
+        "queries_total": len(queries),
     }
+
+
+def run_discovery(conn, dry_run: bool = False, locality: str | None = None) -> dict:
+    """Discover clinics via OSM Overpass. Three modes:
+
+    - locality=None (default): one sweep over the whole Hyderabad bbox, as
+      several smaller per-tag queries rather than one giant one — unchanged,
+      fast, the original behavior.
+    - locality="Jubilee Hills" (etc.): a single small bbox around just that
+      locality's centroid — the most reliable option when the citywide query
+      is timing out, or to target one area on purpose.
+    - locality="all": sweep every configured locality one at a time, prime
+      (hospital-dense/premium) ones first, each with its own small bbox, so
+      progress lands in the database incrementally and prime areas are
+      guaranteed to be covered even if a later locality's query fails. Ends
+      with one citywide catch-all pass for anything outside every named
+      locality. Much slower and far more requests than the default — meant
+      for a deliberate, thorough run, not the everyday `discover`.
+
+    Idempotent in every mode: re-running upserts the same osm:type:id rows
+    rather than duplicating. Raises only if every single query attempted
+    failed, since that likely means the service itself is down.
+    """
+    if locality is None:
+        result = _run_discovery_for_bbox(conn, config.HYDERABAD_BBOX, dry_run, label="citywide")
+        if not dry_run and result["queries_failed"] == result["queries_total"]:
+            raise OverpassError("every Overpass discovery query failed — the service may be down")
+        return {k: v for k, v in result.items() if k != "queries_total"}
+
+    if locality.lower() == "all":
+        totals = {"elements_fetched": 0, "unique_clinics_upserted": 0,
+                   "skipped_unnamed": 0, "queries_failed": 0, "queries_total": 0}
+
+        for loc in config.locality_order():
+            bbox = _bbox_for_locality(loc)
+            if bbox is None:
+                continue
+            print(f"--- locality: {loc} ---")
+            result = _run_discovery_for_bbox(conn, bbox, dry_run, label=loc)
+            for k in totals:
+                totals[k] += result[k]
+
+        print("--- citywide catch-all (anything outside the named localities) ---")
+        result = _run_discovery_for_bbox(conn, config.HYDERABAD_BBOX, dry_run, label="citywide")
+        for k in totals:
+            totals[k] += result[k]
+
+        if not dry_run and totals["queries_total"] and totals["queries_failed"] == totals["queries_total"]:
+            raise OverpassError("every Overpass discovery query failed across every locality — the service may be down")
+
+        totals["localities_swept"] = len(config.LOCALITIES) + 1
+        return {k: v for k, v in totals.items() if k != "queries_total"}
+
+    bbox = _bbox_for_locality(locality)
+    if bbox is None:
+        raise OverpassError(
+            f"no centroid configured for locality {locality!r} — check config.LOCALITY_CENTROIDS"
+        )
+    result = _run_discovery_for_bbox(conn, bbox, dry_run, label=locality)
+    if not dry_run and result["queries_failed"] == result["queries_total"]:
+        raise OverpassError(f"every Overpass query failed for locality {locality!r} — the service may be down")
+    return {k: v for k, v in result.items() if k != "queries_total"}
 
 
 def find_single_clinic(name_hint: str, locality: str | None = None) -> dict | None:
@@ -238,7 +314,7 @@ def find_single_clinic(name_hint: str, locality: str | None = None) -> dict | No
 
     escaped = surname.replace('"', "")
     amenity_pattern = "|".join(_HEALTHCARE_AMENITIES)
-    bbox = _bbox_str()
+    bbox = _bbox_str(config.HYDERABAD_BBOX)
     ql = (
         f'[out:json][timeout:{config.OVERPASS_TIMEOUT_SECONDS}];\n'
         f"(\n"

@@ -49,6 +49,20 @@ def _has_ownership_title(doctor: dict) -> bool:
     return any(kw in designation for kw in config.OWNERSHIP_TITLE_KEYWORDS)
 
 
+def compute_role_category(doctor: dict) -> str:
+    """Founder (has_own_practice) > Senior Decision-Maker (a Director/
+    Chairman/CEO/HOD-style title that didn't clear the founder bar, e.g.
+    blocked by chain size) > Staff (everyone else — still shown, still
+    scored, just the default bucket). Call with has_own_practice already
+    resolved for this run, not a possibly-stale value from before enrich."""
+    if doctor.get("has_own_practice"):
+        return "Founder"
+    designation = (doctor.get("designation") or "").lower()
+    if any(kw in designation for kw in config.SENIOR_DESIGNATION_KEYWORDS):
+        return "Senior Decision-Maker"
+    return "Staff"
+
+
 def detect_own_practice(conn, doctor: dict) -> bool:
     if _is_founder_from_sources(conn, doctor["id"]):
         return True
@@ -100,6 +114,7 @@ def run_enrichment(conn, dry_run: bool = False) -> dict:
 
     own_practice_set = 0
     clinics_linked = 0
+    role_categories_set = 0
 
     # Link hospital-only doctors to a private clinic FIRST. Own-practice
     # detection below depends on clinic_name (surname match), so it must run
@@ -122,14 +137,23 @@ def run_enrichment(conn, dry_run: bool = False) -> dict:
         if dry_run:
             continue
         own_practice = detect_own_practice(conn, doctor)
+        role_category = compute_role_category({**doctor, "has_own_practice": own_practice})
+
+        updates = {}
         if own_practice != bool(doctor.get("has_own_practice")):
-            db.update_doctor(conn, doctor["id"], {"has_own_practice": int(own_practice)})
+            updates["has_own_practice"] = int(own_practice)
             if own_practice:
                 own_practice_set += 1
+        if role_category != doctor.get("role_category"):
+            updates["role_category"] = role_category
+            role_categories_set += 1
+        if updates:
+            db.update_doctor(conn, doctor["id"], updates)
 
     return {
         "doctors_evaluated": len(doctors),
         "own_practice_flags_set": own_practice_set,
+        "role_categories_set": role_categories_set,
         "hospital_only_doctors": len(hospital_only),
         "private_clinics_linked": clinics_linked,
     }

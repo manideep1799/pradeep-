@@ -31,6 +31,8 @@ def _doctor_row_from_extraction(doc: dict, clinic: dict) -> dict:
         "email": None,  # filled in from clinic_email at the call site
         "website": clinic["website"],
         "instagram_handle": None,
+        "facebook_url": None,
+        "linkedin_url": None,
         "youtube_url": None,
         "has_own_practice": None,
     }
@@ -67,7 +69,7 @@ def run_clinic_extraction(conn, dry_run: bool = False, limit: int | None = None)
             seen_names = set()
             designations_seen = []
             for url, page_html in candidates:
-                text = extract.html_to_text(page_html)
+                text = extract.html_to_text(page_html, base_url=url)
                 result = extract.extract_structured(text, mode="clinic")
                 if not result:
                     continue
@@ -81,14 +83,20 @@ def run_clinic_extraction(conn, dry_run: bool = False, limit: int | None = None)
 
                     row = _doctor_row_from_extraction(doc, clinic)
                     row["email"] = result.get("clinic_email")
-                    row["instagram_handle"] = result.get("instagram_url")
-                    row["youtube_url"] = result.get("youtube_url")
+                    # Prefer the doctor's own personal profile link when the
+                    # page gave one; fall back to the clinic's shared account.
+                    row["instagram_handle"] = doc.get("instagram_url") or result.get("instagram_url")
+                    row["facebook_url"] = doc.get("facebook_url") or result.get("facebook_url")
+                    row["linkedin_url"] = doc.get("linkedin_url") or result.get("linkedin_url")
+                    row["youtube_url"] = doc.get("youtube_url") or result.get("youtube_url")
 
                     doctor_id = db.insert_doctor(conn, row)
                     raw = {
                         **doc,
                         "clinic_email": result.get("clinic_email"),
                         "instagram_url": result.get("instagram_url"),
+                        "facebook_url": result.get("facebook_url"),
+                        "linkedin_url": result.get("linkedin_url"),
                         "youtube_url": result.get("youtube_url"),
                         "has_online_booking": result.get("has_online_booking"),
                     }
